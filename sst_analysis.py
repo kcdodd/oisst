@@ -221,6 +221,103 @@ def animate(files, mean = None):
   im = Image.fromarray(barcode, mode='RGB')
   im.save(out_file.parent/(out_file.name[:-4]+'.png'))
 
+
+#===============================================================================
+def animate_modes(times, basis, modes):
+
+  out_dir = OUT_DIR/"animated_modes"
+  out_dir.mkdir(exist_ok=True)
+  font = ImageFont.truetype("dejavu/DejaVuSansMono.ttf", 32)
+  font_cb = ImageFont.truetype("dejavu/DejaVuSansMono.ttf", 16)
+
+  # cmap = plt.get_cmap('berlin')
+  import colorcet as cc
+  # colors = np.concatenate([
+  #   cc.cm.CET_L6_r(jnp.arange(100)/99),
+  #   cc.cm.CET_L8(jnp.arange(156)/155)],
+  #   axis=0)
+  colors = np.concatenate([
+    cc.cm.CET_L6_r(jnp.arange(128)/127),
+    cc.cm.CET_L8(jnp.arange(128)/127)],
+    axis=0)
+
+  colorbar_data = np.clip(
+    255*colors[None,:,:3]*jnp.ones(20)[:,None,None],
+    0,
+    255).astype(np.uint8)
+
+  cmap = LinearSegmentedColormap.from_list("mycmap", colors)
+
+
+  import av
+  out_file = out_dir/f"{out_dir.name}.mp4"
+  out_file.unlink(missing_ok=True)
+  container = av.open(out_file, mode="w")
+  stream = container.add_stream("libx264", rate=24)
+  stream.width = 1440
+  stream.height = 720
+  stream.pix_fmt = "yuv420p"
+
+  if mean is None:
+    cmap_range = [0, 30]
+  else:
+    cmap_range = [-15, 15]
+
+
+  cb = Image.fromarray(colorbar_data, mode='RGB')
+  draw = ImageDraw.Draw(cb)
+  width, height = cb.size
+  draw.text((0, 0), f"{cmap_range[0]:+.0f}", (32,)*3, font=font_cb)
+  draw.text((width-30, 0), f"{cmap_range[1]:+.0f}", (32,)*3, font=font_cb)
+  colorbar_data = np.asarray(cb)
+  # Figure(Plot2D(colorbar_data)).fig()
+
+  scale = 1.0/(cmap_range[1] - cmap_range[0])
+  vmin = cmap_range[0]
+  barcode = []
+
+
+  times = [datetime.fromtimestamp(t) for t in times]
+  basis = np.roll(basis, 675, axis=2)
+
+  for frame in range(len(modes)):
+    time_str = times[frame].strftime('%d %b %Y')
+    sst = jnp.einsum('m,mij', modes[frame], basis)
+
+    print(f"- {time_str}")
+    rgb = cmap(scale*(sst - vmin))[::-1,:,:3]
+    rgb = np.clip(rgb*255, 0, 255).astype(np.uint8)
+    barcode.append(np.clip(np.mean(rgb, axis=1), 0, 255).astype(np.uint8))
+
+    rgb[-42:-22,300:556] = colorbar_data
+
+    im = Image.fromarray(rgb, mode='RGB')
+    draw = ImageDraw.Draw(im)
+    width, height = im.size
+    draw.text((10, height-50), time_str, (185,)*3, font=font)
+    # im.save(fname)
+
+    rgb24 = np.asarray(im)
+
+    frame = av.VideoFrame.from_ndarray(rgb24, format="rgb24")
+    for packet in stream.encode(frame):
+        container.mux(packet)
+
+  # Flush stream
+  for packet in stream.encode():
+    container.mux(packet)
+
+  # Close the file
+  container.close()
+
+  barcode = np.stack(barcode, axis=1)
+  print(f"{barcode.shape=}")
+  barcode = np.clip(
+    sp.ndimage.zoom(barcode, [1.0, 1440.0/barcode.shape[1], 1.0]),
+    0, 255).astype(np.uint8)
+  im = Image.fromarray(barcode, mode='RGB')
+  im.save(out_file.parent/(out_file.name[:-4]+'.png'))
+
 #===============================================================================
 def to_blocks(arr):
   arr = arr.reshape(arr.shape[0], 24, 30, 48, 30)
@@ -510,15 +607,24 @@ if not full_file.exists():
       sst_dset[offset:offset+n] = sst
       time_dset[offset:offset+n] = times
 
+with h5py.File(full_file, 'r') as sst_full:
+  times = np.array(sst_full['time'])
 
 block_size = 45
 block_shape = (720//block_size, 1440//block_size)
 
 # number of spatial modes to project for frequency generation
-nmodes = 256
+# this should be multiple of 2, every two modes approximate conjugate eigenvalues
+nmodes = 64
 assert nmodes%2 == 0
 
-modes_file = DATA_DIR/f"sst_diff_modes_{nmodes:03d}.npz"
+# oversample during randomized SVD, nmodes is closer to the true rank
+nextra = 8
+
+
+# modes_file = DATA_DIR/f"sst_diff_modes_{nmodes:03d}.npz"
+modes_file = DATA_DIR/f"sst_modes_{nmodes:03d}.npz"
+
 block_modes_file = DATA_DIR/(f'block_{block_size:d}_' + modes_file.name)
 # modes_file.unlink(missing_ok=True)
 
@@ -530,7 +636,7 @@ if not modes_file.exists():
     sst_delta = sst_full['sst_delta']
     nframes = len(sst_delta)
 
-    nbatch = 64
+    nbatch = 256
     mask = ~jnp.isfinite(sst_delta[0])
     valid = Enclose(jnp.where, mask, 0.0)
 
@@ -543,8 +649,8 @@ if not modes_file.exists():
       last = _batch[-1:]
       return batch, last
 
-
-    Z = random.normal(random.key(123), (nmodes, 720, 1440))
+    xmodes = nmodes + nextra
+    Z = random.normal(random.key(123), (xmodes, 720, 1440))
 
     # Y -> (nframes, nmodes)
     Y = []
@@ -553,8 +659,9 @@ if not modes_file.exists():
     for k in range(0, nframes, nbatch):
       print(f"Y <- A Z: {k}/{nframes}")
       batch, last = _get_batch(k, last)
-      Y.append(jnp.einsum('kij,mij->km', batch, Z))
+      Y.append(np.asarray(jnp.einsum('kij,mij->km', batch, Z)))
 
+    del Z
     Y = jnp.concat(Y, axis=0)
 
     # Figure(Plot2D(Y, title='Y')).fig()
@@ -567,7 +674,7 @@ if not modes_file.exists():
 
     # Figure(Plot2D(Q, title='Q')).fig()
 
-    B = jnp.zeros((nmodes, 720, 1440), Q.dtype)
+    B = jnp.zeros((xmodes, 720, 1440), Q.dtype)
     last = valid(sst_delta[:1])
 
     for k in range(0, nframes, nbatch):
@@ -579,14 +686,17 @@ if not modes_file.exists():
     # Figure(Plot2D((B[0] + 1j*B[1]).T), Plot2D((B[2] + 1j*B[3]).T), title='B').fig()
 
     print("_U s Vh <- B")
-    _U, s, basis = jnp.linalg.svd(B.reshape(nmodes, -1), full_matrices=False)
+    _U, s, basis = jnp.linalg.svd(B.reshape(xmodes, -1), full_matrices=False)
     del B
-    basis = basis.reshape(nmodes, 720, 1440)
+    basis = basis.reshape(xmodes, 720, 1440)
 
     _U = _U*s[None,:]
     print("U <- Q _U")
-    modes = jnp.einsum('ki,im -> km', Q, _U)
+    modes = jnp.einsum('ki,im -> km', Q, _U).astype(jnp.float16)
     del _U, s
+
+    modes = modes[:,:nmodes]
+    basis = basis[:nmodes]
 
     error = []
     last = valid(sst_delta[:1])
@@ -597,10 +707,11 @@ if not modes_file.exists():
 
       approx = jnp.einsum('km,mij->kij', modes[k:k+nbatch], basis)
       err = jnp.mean((approx - batch)**2, axis=(1,2))**0.5
-      error.append(err)
+      error.append(np.asarray(err.astype(jnp.float16)))
       print(f"  ~ {jnp.mean(err):.2e}")
+      del approx, err
 
-    error = jnp.concat(error, axis=0)
+    error = np.concatenate(error, axis=0)
     print(f"rms error ~ {jnp.mean(error):.2e}")
 
     # Figure(Plot2D((basis[0] + 1j*basis[1]).T), Plot2D((basis[2] + 1j*basis[3]).T), title='basis').fig()
@@ -625,13 +736,17 @@ else:
 #     Plot2D((basis[k+6] + 1j*basis[k+7]).T, title=f'basis {k+6}-{k+7}')]]).fig()
 
 # Figure(Plot2D(modes, title='modes')).fig()
+
+# animate_modes(times, basis, modes)
+# exit()
+
 del modes
 #===============================================================================
 if not block_modes_file.exists():
   with h5py.File(full_file, 'r') as sst_full:
     sst_delta = sst_full['sst_delta']
     nframes = len(sst_delta)
-    nbatch = 64
+    nbatch = 256
 
     mask = ~jnp.isfinite(sst_delta[0])
     valid = Enclose(jnp.where, mask, 0.0)
@@ -659,11 +774,12 @@ if not block_modes_file.exists():
 
       # -> (nframes, 16, 32, 45, 45)
       batch = batch.reshape(len(batch), 16, 45, 32, 45).transpose(0,1,3,2,4)
-      block_modes.append(jnp.einsum('...mij,k...ij->k...m', block_basis, batch))
-      del batch
-      print(f"  {sum(b.nbytes for b in block_modes)=}")
+      _modes = jnp.einsum('...mij,k...ij->k...m', block_basis, batch).astype(jnp.float16)
+      block_modes.append(np.asarray(_modes))
+      del batch, _modes
+      # print(f"  {sum(b.nbytes for b in block_modes)/1e9}, {block_modes[-1].shape=}")
 
-    block_modes = jnp.concat(block_modes, axis=0)
+    block_modes = np.concatenate(block_modes, axis=0)
     # -> (16, 32, nframes, nmodes)
     block_modes = block_modes.transpose(1,2,0,3)
 
@@ -676,6 +792,8 @@ else:
   block_modes = data['block_modes']
   block_basis = data['block_basis']
   del data
+
+# Figure(Plot2D(block_modes[5,16], title='modes')).fig()
 
 # if not block_modes_file.exists():
 #   with h5py.File(full_file, 'r') as sst_full, h5py.File(modes_file, 'x') as sst_modes:
@@ -767,7 +885,7 @@ else:
 # del freq_sq_mean
 
 
-
+del block_basis
 # step when inserting frequency modes, skipped frequencies are zero amplitude
 freq_step = 1
 # hertz, exponential decay rate for frequency equilization
@@ -775,7 +893,7 @@ freq_decay = 1000
 
 frame_rate = 24
 samplerate = 44100
-nmodes = 128
+# nmodes = 128
 
 nframes = block_modes.shape[2]
 nsamples = int((nframes/frame_rate)*samplerate)
@@ -788,8 +906,8 @@ frame_rate = samplerate/frame_samples
 left = None
 right = None
 
-# for i in range(block_shape[0]):
-for i in [5]:
+for i in range(block_shape[0]):
+# for i in [5]:
   for j in range(block_shape[1]):
   # for j in [15]:
     left_weight = 0.5*(1.0 + np.cos(np.pi*j/32))
