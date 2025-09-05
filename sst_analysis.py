@@ -223,7 +223,7 @@ def animate(files, mean = None):
 
 
 #===============================================================================
-def animate_modes(times, basis, modes):
+def animate_modes(nframes, times, basis, modes):
 
   out_dir = OUT_DIR/"animated_modes"
   out_dir.mkdir(exist_ok=True)
@@ -280,7 +280,7 @@ def animate_modes(times, basis, modes):
   times = [datetime.fromtimestamp(t) for t in times]
   basis = np.roll(basis, 675, axis=2)
 
-  for frame in range(len(modes)):
+  for frame in range(nframes):
     time_str = times[frame].strftime('%d %b %Y')
     sst = jnp.einsum('m,mij', modes[frame], basis)
 
@@ -615,28 +615,59 @@ block_shape = (720//block_size, 1440//block_size)
 
 # number of spatial modes to project for frequency generation
 # this should be multiple of 2, every two modes approximate conjugate eigenvalues
-nmodes = 64
+nmodes = 512
 assert nmodes%2 == 0
 
 # oversample during randomized SVD, nmodes is closer to the true rank
 nextra = 8
+xmodes = nmodes + nextra
 
+nbatch = 256
 
 # modes_file = DATA_DIR/f"sst_diff_modes_{nmodes:03d}.npz"
-modes_file = DATA_DIR/f"sst_modes_{nmodes:03d}.npz"
+modes_file = OUT_DIR/f"modes_{nmodes:03d}.h5"
 
-block_modes_file = DATA_DIR/(f'block_{block_size:d}_' + modes_file.name)
+block_modes_file = OUT_DIR/(f'block_{block_size:d}_' + modes_file.name)
 # modes_file.unlink(missing_ok=True)
 
 diffed = modes_file.name.startswith('sst_diff')
 
 if not modes_file.exists():
   # approximate, random SVD
-  with h5py.File(full_file, 'r') as sst_full:
+  with h5py.File(full_file, 'r') as sst_full, h5py.File(modes_file, 'x') as sst_modes:
     sst_delta = sst_full['sst_delta']
     nframes = len(sst_delta)
 
-    nbatch = 256
+    sst_modes['time'] = np.asarray(sst_full['time'])
+    sst_modes['mask'] = np.isfinite(sst_delta[0])
+
+    modes = sst_modes.create_dataset(
+      'modes',
+      shape = (nframes, nmodes),
+      dtype = np.float16,
+      compression="gzip",
+      compression_opts=7)
+
+    basis = sst_modes.create_dataset(
+      'basis',
+      shape = (nmodes, 720, 1440),
+      dtype = np.float16,
+      compression="gzip",
+      compression_opts=7)
+
+    errors = sst_modes.create_dataset(
+      'errors',
+      shape = (nframes,),
+      dtype = np.float16,
+      compression="gzip",
+      compression_opts=7)
+
+    Y = sst_modes.create_dataset(
+      'Y',
+      shape = (nframes, xmodes),
+      dtype = np.float64)
+
+
     mask = ~jnp.isfinite(sst_delta[0])
     valid = Enclose(jnp.where, mask, 0.0)
 
@@ -649,28 +680,24 @@ if not modes_file.exists():
       last = _batch[-1:]
       return batch, last
 
-    xmodes = nmodes + nextra
+
     Z = random.normal(random.key(123), (xmodes, 720, 1440))
 
-    # Y -> (nframes, nmodes)
-    Y = []
     last = valid(sst_delta[:1])
 
     for k in range(0, nframes, nbatch):
       print(f"Y <- A Z: {k}/{nframes}")
       batch, last = _get_batch(k, last)
-      Y.append(np.asarray(jnp.einsum('kij,mij->km', batch, Z)))
+      Y[k:k+nbatch] = jnp.einsum('kij,mij->km', batch, Z)
+      del batch
 
     del Z
-    Y = jnp.concat(Y, axis=0)
-
-    # Figure(Plot2D(Y, title='Y')).fig()
 
     print("Q R <- Y")
     # Q -> (nframes, nmodes)
-    Q, R = jnp.linalg.qr(Y)
+    Q, R = jnp.linalg.qr(jnp.asarray(Y))
     print(f"{Y.shape=} -> {Q.shape=}")
-    del Y, R
+    del Y, R, sst_modes['Y']
 
     # Figure(Plot2D(Q, title='Q')).fig()
 
@@ -680,67 +707,64 @@ if not modes_file.exists():
     for k in range(0, nframes, nbatch):
       print(f"B <- Q^T A: {k}/{nframes}")
       batch, last = _get_batch(k, last)
-
       B = B + jnp.einsum('km,kij->mij', Q[k:k+nbatch], batch)
-
-    # Figure(Plot2D((B[0] + 1j*B[1]).T), Plot2D((B[2] + 1j*B[3]).T), title='B').fig()
+      del batch
 
     print("_U s Vh <- B")
-    _U, s, basis = jnp.linalg.svd(B.reshape(xmodes, -1), full_matrices=False)
+    _U, s, _basis = jnp.linalg.svd(B.reshape(xmodes, -1), full_matrices=False)
     del B
-    basis = basis.reshape(xmodes, 720, 1440)
+    _basis = _basis.reshape(xmodes, 720, 1440)
 
     _U = _U*s[None,:]
     print("U <- Q _U")
-    modes = jnp.einsum('ki,im -> km', Q, _U).astype(jnp.float16)
+    _modes = jnp.einsum('ki,im -> km', Q, _U)
     del _U, s
 
-    modes = modes[:,:nmodes]
-    basis = basis[:nmodes]
+    _modes = _modes[:,:nmodes]
+    _basis = _basis[:nmodes]
 
-    error = []
+    modes[:] = _modes
+    basis[:] = _basis
+
+    del _modes
+
     last = valid(sst_delta[:1])
 
     for k in range(0, nframes, nbatch):
       print(f"error: {k}/{nframes}")
       batch, last = _get_batch(k, last)
 
-      approx = jnp.einsum('km,mij->kij', modes[k:k+nbatch], basis)
+      approx = jnp.einsum('km,mij->kij', jnp.asarray(modes[k:k+nbatch], np.float64), _basis)
       err = jnp.mean((approx - batch)**2, axis=(1,2))**0.5
-      error.append(np.asarray(err.astype(jnp.float16)))
+      errors[k:k+nbatch] = err
       print(f"  ~ {jnp.mean(err):.2e}")
-      del approx, err
-
-    error = np.concatenate(error, axis=0)
-    print(f"rms error ~ {jnp.mean(error):.2e}")
+      del approx, err, batch
 
     # Figure(Plot2D((basis[0] + 1j*basis[1]).T), Plot2D((basis[2] + 1j*basis[3]).T), title='basis').fig()
     # Figure(Plot2D(modes, title='modes')).fig()
 
-    np.savez(
-      modes_file,
-      modes = modes,
-      basis = basis,
-      error = error)
-else:
-  data = np.load(modes_file)
-  modes = data['modes']
-  basis = data['basis']
-  del data
+#===============================================================================
+# with h5py.File(modes_file, 'r') as sst_modes:
+#   basis = sst_modes['basis']
 
-# for k in range(0, len(basis), 8):
-#   Figure([[
-#     Plot2D((basis[k] + 1j*basis[k+1]).T, title=f'basis {k}-{k+1}'),
-#     Plot2D((basis[k+2] + 1j*basis[k+3]).T, title=f'basis {k+2}-{k+3}')],[
-#     Plot2D((basis[k+4] + 1j*basis[k+5]).T, title=f'basis {k+4}-{k+5}'),
-#     Plot2D((basis[k+6] + 1j*basis[k+7]).T, title=f'basis {k+6}-{k+7}')]]).fig()
+#   for k in range(0, len(basis), 8):
+#     Figure([[
+#       Plot2D((basis[k] + 1j*basis[k+1]).T, title=f'basis {k}-{k+1}'),
+#       Plot2D((basis[k+2] + 1j*basis[k+3]).T, title=f'basis {k+2}-{k+3}')],[
+#       Plot2D((basis[k+4] + 1j*basis[k+5]).T, title=f'basis {k+4}-{k+5}'),
+#       Plot2D((basis[k+6] + 1j*basis[k+7]).T, title=f'basis {k+6}-{k+7}')]]).fig()
 
-# Figure(Plot2D(modes, title='modes')).fig()
+#   Figure(Plot2D(sst_modes['modes'], title='modes')).fig()
 
-# animate_modes(times, basis, modes)
-# exit()
+#===============================================================================
+with h5py.File(modes_file, 'r') as sst_modes:
+  basis = np.where(sst_modes['mask'], sst_modes['basis'], np.nan)
+  nframes = len(sst_modes['modes'])
+  nframes = 3*365
+  animate_modes(nframes, sst_modes['time'], basis, sst_modes['modes'])
 
-del modes
+exit()
+
 #===============================================================================
 if not block_modes_file.exists():
   with h5py.File(full_file, 'r') as sst_full:
