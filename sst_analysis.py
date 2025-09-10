@@ -237,7 +237,7 @@ def animate_sst(nframes, times, sst_delta):
       _sst_f = np.fft.ifftshift(_sst_f, axes=(1,2))
 
       # before = _sst
-      _sst = np.fft.ifft2(_sst_f, norm='ortho').real
+      _sst = np.fft.ifft2(_sst_f, axes=(1,2), norm='ortho').real
       # Figure(Plot2D(before[0]), Plot2D(_sst[0])).fig()
 
     if last is None:
@@ -688,6 +688,8 @@ block_shape = (720//block_size, 1440//block_size)
 nmodes = 512
 assert nmodes%2 == 0
 
+nmodes_global = 8
+
 # oversample during randomized SVD, nmodes is closer to the true rank
 nextra = 8
 xmodes = nmodes + nextra
@@ -695,7 +697,7 @@ xmodes = nmodes + nextra
 nbatch = 256
 
 # modes_file = DATA_DIR/f"sst_diff_modes_{nmodes:03d}.npz"
-modes_file = OUT_DIR/f"modes_{nmodes:03d}.h5"
+modes_file = OUT_DIR/f"global_modes_{nmodes_global:03d}.h5"
 
 block_modes_file = OUT_DIR/(f'block_{block_size:d}_' + modes_file.name)
 # modes_file.unlink(missing_ok=True)
@@ -713,14 +715,14 @@ if not modes_file.exists():
 
     modes = sst_modes.create_dataset(
       'modes',
-      shape = (nframes, nmodes),
+      shape = (nframes, nmodes_global),
       dtype = np.float16,
       compression="gzip",
       compression_opts=7)
 
     basis = sst_modes.create_dataset(
       'basis',
-      shape = (nmodes, 720, 1440),
+      shape = (nmodes_global, 720, 1440),
       dtype = np.float16,
       compression="gzip",
       compression_opts=7)
@@ -734,7 +736,7 @@ if not modes_file.exists():
 
     Y = sst_modes.create_dataset(
       'Y',
-      shape = (nframes, xmodes),
+      shape = (nframes, nmodes_global),
       dtype = np.float64)
 
 
@@ -751,7 +753,7 @@ if not modes_file.exists():
       return batch, last
 
 
-    Z = random.normal(random.key(123), (xmodes, 720, 1440))
+    Z = random.normal(random.key(123), (nmodes_global, 720, 1440))
 
     last = valid(sst_delta[:1])
 
@@ -771,7 +773,7 @@ if not modes_file.exists():
 
     # Figure(Plot2D(Q, title='Q')).fig()
 
-    B = jnp.zeros((xmodes, 720, 1440), Q.dtype)
+    B = jnp.zeros((nmodes_global, 720, 1440), Q.dtype)
     last = valid(sst_delta[:1])
 
     for k in range(0, nframes, nbatch):
@@ -781,34 +783,20 @@ if not modes_file.exists():
       del batch
 
     print("_U s Vh <- B")
-    _U, s, _basis = jnp.linalg.svd(B.reshape(xmodes, -1), full_matrices=False)
+    _U, s, _basis = jnp.linalg.svd(B.reshape(nmodes_global, -1), full_matrices=False)
     del B
-    _basis = _basis.reshape(xmodes, 720, 1440)
+    _basis = _basis.reshape(nmodes_global, 720, 1440)
 
     _U = _U*s[None,:]
     print("U <- Q _U")
     _modes = jnp.einsum('ki,im -> km', Q, _U)
     del _U, s
 
-    _modes = _modes[:,:nmodes]
-    _basis = _basis[:nmodes]
-
     modes[:] = _modes
     basis[:] = _basis
 
-    del _modes
+    del _modes, _basis
 
-    last = valid(sst_delta[:1])
-
-    for k in range(0, nframes, nbatch):
-      print(f"error: {k}/{nframes}")
-      batch, last = _get_batch(k, last)
-
-      approx = jnp.einsum('km,mij->kij', jnp.asarray(modes[k:k+nbatch], np.float64), _basis)
-      err = jnp.mean((approx - batch)**2, axis=(1,2))**0.5
-      errors[k:k+nbatch] = err
-      print(f"  ~ {jnp.mean(err):.2e}")
-      del approx, err, batch
 
     # Figure(Plot2D((basis[0] + 1j*basis[1]).T), Plot2D((basis[2] + 1j*basis[3]).T), title='basis').fig()
     # Figure(Plot2D(modes, title='modes')).fig()
@@ -825,17 +813,27 @@ if not modes_file.exists():
 
 
 #===============================================================================
-# with h5py.File(modes_file, 'r') as sst_modes:
-#   basis = sst_modes['basis']
+with h5py.File(modes_file, 'r') as sst_modes:
+  basis = sst_modes['basis']
 
-#   for k in range(0, len(basis), 8):
-#     Figure([[
-#       Plot2D((basis[k] + 1j*basis[k+1]).T, title=f'basis {k}-{k+1}'),
-#       Plot2D((basis[k+2] + 1j*basis[k+3]).T, title=f'basis {k+2}-{k+3}')],[
-#       Plot2D((basis[k+4] + 1j*basis[k+5]).T, title=f'basis {k+4}-{k+5}'),
-#       Plot2D((basis[k+6] + 1j*basis[k+7]).T, title=f'basis {k+6}-{k+7}')]]).fig()
+  # for k in range(0, len(basis), 8):
+  #   Figure([[
+  #     Plot2D((basis[k] + 1j*basis[k+1]).T, title=f'basis {k}-{k+1}'),
+  #     Plot2D((basis[k+2] + 1j*basis[k+3]).T, title=f'basis {k+2}-{k+3}')],[
+  #     Plot2D((basis[k+4] + 1j*basis[k+5]).T, title=f'basis {k+4}-{k+5}'),
+  #     Plot2D((basis[k+6] + 1j*basis[k+7]).T, title=f'basis {k+6}-{k+7}')]]).fig()
 
-#   Figure(Plot2D(sst_modes['modes'], title='modes')).fig()
+  for k in range(0, len(basis), 4):
+    Figure([[
+      Plot2D((basis[k]).T, title=f'basis {k}'),
+      Plot2D((basis[k+1]).T, title=f'basis {k+1}')],[
+      Plot2D((basis[k+2]).T, title=f'basis {k+2}'),
+      Plot2D((basis[k+3]).T, title=f'basis {k+3}')]]).fig()
+
+
+  Figure(Plot2D(sst_modes['modes'], title='modes')).fig()
+
+exit()
 
 # #===============================================================================
 # with h5py.File(modes_file, 'r') as sst_modes:
